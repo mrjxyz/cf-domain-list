@@ -1,10 +1,9 @@
-name: Sync Domain Sources
+name: Sync BestCF Sources
 
 on:
   workflow_dispatch:
 
   schedule:
-    # 每 6 小时运行
     - cron: "0 */6 * * *"
 
 permissions:
@@ -25,61 +24,106 @@ jobs:
 
           mkdir -p /tmp/sources
 
-          urls=(
-            "https://bestcf.pages.dev/domain/all.txt"
-            "https://bestcf.pages.dev/vps789/top10.txt"
-            "https://bestcf.pages.dev/domain/qms/all.txt"
-            "https://bestcf.pages.dev/wetest/ipv4.txt"
-            "https://bestcf.pages.dev/xinyitang3/ipv4.txt"
-            "https://bestcf.pages.dev/tiancheng/all.txt"
-            "https://bestcf.pages.dev/cmliu/all.txt"
-            "https://bestcf.pages.dev/lzj/all.txt"
-            "https://bestcf.pages.dev/lajiao/all.txt"
-          )
+          download() {
+            name="$1"
+            url="$2"
 
-          i=1
-
-          for url in "${urls[@]}"; do
-            echo "Downloading: $url"
+            echo "Downloading: $name"
 
             curl -L \
               --fail \
               --retry 3 \
               --connect-timeout 15 \
-              --max-time 60 \
+              --max-time 120 \
               "$url" \
-              -o "/tmp/sources/$i.txt"
+              -o "/tmp/sources/$name.txt"
 
-            if [ ! -s "/tmp/sources/$i.txt" ]; then
-              echo "ERROR: empty source: $url"
+            if [ ! -s "/tmp/sources/$name.txt" ]; then
+              echo "ERROR: empty source: $name"
               exit 1
             fi
 
-            i=$((i + 1))
+            echo "Downloaded $(wc -l < "/tmp/sources/$name.txt") lines"
+          }
+
+          download "domain" \
+            "https://bestcf.pages.dev/domain/all.txt"
+
+          download "vps789" \
+            "https://bestcf.pages.dev/vps789/top10.txt"
+
+          download "qms" \
+            "https://bestcf.pages.dev/domain/qms/all.txt"
+
+          download "wetest" \
+            "https://bestcf.pages.dev/wetest/ipv4.txt"
+
+          download "xinyitang3" \
+            "https://bestcf.pages.dev/xinyitang3/ipv4.txt"
+
+          download "tiancheng" \
+            "https://bestcf.pages.dev/tiancheng/all.txt"
+
+          download "cmliu" \
+            "https://bestcf.pages.dev/cmliu/all.txt"
+
+          download "lzj" \
+            "https://bestcf.pages.dev/lzj/all.txt"
+
+          download "lajiao" \
+            "https://bestcf.pages.dev/lajiao/all.txt"
+
+      - name: Normalize sources
+        shell: bash
+        run: |
+          set -e
+
+          mkdir -p /tmp/normalized
+
+          for file in /tmp/sources/*.txt; do
+            name=$(basename "$file")
+
+            echo "Normalize: $name"
+
+            # CRLF -> LF
+            tr -d '\r' < "$file" |
+
+            # 每个地址强制独立一行
+            sed -E 's/([0-9]{1,3}(\.[0-9]{1,3}){3}:[0-9]{1,5}#[^0-9[:space:]]+)/\1\n/g' |
+
+            # 去除首尾空白
+            sed 's/^[[:space:]]*//' |
+            sed 's/[[:space:]]*$//' |
+
+            # 删除空行
+            sed '/^$/d' \
+            > "/tmp/normalized/$name"
           done
 
-      - name: Merge and deduplicate
+      - name: Generate all.txt
         shell: bash
         run: |
           set -e
 
           mkdir -p domain
 
-          cat /tmp/sources/*.txt \
-            | tr -d '\r' \
-            | sed 's/[[:space:]]*$//' \
+          cat /tmp/normalized/*.txt \
+            | sed 's/\r//g' \
             | sed '/^[[:space:]]*$/d' \
-            > /tmp/all-raw.txt
+            > /tmp/all.txt
 
           python3 <<'PY'
           import re
 
-          input_file = "/tmp/all-raw.txt"
-          output_file = "domain/all.txt"
+          src = "/tmp/all.txt"
+          dst = "domain/all.txt"
 
-          # 匹配：
-          # 1.2.3.4:443#备注
-          # example.com:443#备注
+          # 支持：
+          # IP:443
+          # IP:443#备注
+          # domain.com:443
+          # domain.com:443#备注
+
           pattern = re.compile(
               r'^([A-Za-z0-9.-]+):([0-9]{1,5})(?:#(.*))?$'
           )
@@ -87,24 +131,28 @@ jobs:
           seen = set()
           result = []
 
-          with open(input_file, "r", encoding="utf-8") as f:
+          with open(src, "r", encoding="utf-8", errors="ignore") as f:
+
               for raw in f:
+
                   line = raw.strip()
 
                   if not line:
                       continue
 
+                  # 删除 BOM
+                  line = line.lstrip("\ufeff")
+
                   m = pattern.match(line)
 
-                  # 非标准行直接跳过
                   if not m:
                       continue
 
                   host = m.group(1).lower()
                   port = m.group(2)
-                  remark = m.group(3) or ""
+                  remark = (m.group(3) or "").strip()
 
-                  # 地址 + 端口作为唯一 KEY
+                  # 地址 + 端口唯一
                   key = f"{host}:{port}"
 
                   if key in seen:
@@ -113,73 +161,21 @@ jobs:
                   seen.add(key)
 
                   if remark:
-                      result.append(f"{host}:{port}#{remark}")
+                      result.append(
+                          f"{host}:{port}#{remark}"
+                      )
                   else:
-                      result.append(f"{host}:{port}")
+                      result.append(
+                          f"{host}:{port}"
+                      )
 
-          with open(output_file, "w", encoding="utf-8") as f:
-              f.write("\n".join(result))
-              f.write("\n")
+          with open(dst, "w", encoding="utf-8") as f:
+              for line in result:
+                  f.write(line + "\n")
 
+          print("================================")
           print(f"Total unique entries: {len(result)}")
-          PY
-
-      - name: Generate IPv4 list
-        shell: bash
-        run: |
-          python3 <<'PY'
-          import re
-
-          src = "domain/all.txt"
-          dst = "domain/ipv4.txt"
-
-          ipv4 = re.compile(
-              r'^([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]{1,5}(#.*)?$'
-          )
-
-          result = []
-
-          with open(src, "r", encoding="utf-8") as f:
-              for line in f:
-                  line = line.strip()
-
-                  if ipv4.match(line):
-                      result.append(line)
-
-          with open(dst, "w", encoding="utf-8") as f:
-              f.write("\n".join(result))
-              f.write("\n")
-
-          print(f"IPv4 entries: {len(result)}")
-          PY
-
-      - name: Generate domain list
-        shell: bash
-        run: |
-          python3 <<'PY'
-          import re
-
-          src = "domain/all.txt"
-          dst = "domain/domains.txt"
-
-          domain = re.compile(
-              r'^[A-Za-z0-9.-]+\.[A-Za-z]{2,}:[0-9]{1,5}(#.*)?$'
-          )
-
-          result = []
-
-          with open(src, "r", encoding="utf-8") as f:
-              for line in f:
-                  line = line.strip()
-
-                  if domain.match(line):
-                      result.append(line)
-
-          with open(dst, "w", encoding="utf-8") as f:
-              f.write("\n".join(result))
-              f.write("\n")
-
-          print(f"Domain entries: {len(result)}")
+          print("================================")
           PY
 
       - name: Check result
@@ -188,32 +184,35 @@ jobs:
           set -e
 
           total=$(grep -cve '^[[:space:]]*$' domain/all.txt || true)
-          ipv4=$(grep -cve '^[[:space:]]*$' domain/ipv4.txt || true)
-          domains=$(grep -cve '^[[:space:]]*$' domain/domains.txt || true)
 
-          echo "======================"
-          echo "Total   : $total"
-          echo "IPv4    : $ipv4"
-          echo "Domains : $domains"
-          echo "======================"
+          echo "Total: $total"
 
-          if [ "$total" -lt 5 ]; then
-            echo "ERROR: Too few entries."
+          if [ "$total" -lt 10 ]; then
+            echo "ERROR: result contains too few entries"
             exit 1
           fi
 
-      - name: Commit changes
+          echo
+          echo "First 20:"
+          head -20 domain/all.txt
+
+          echo
+          echo "Last 20:"
+          tail -20 domain/all.txt
+
+      - name: Commit
         shell: bash
         run: |
           git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add domain/
+          git add domain/all.txt
 
           if git diff --cached --quiet; then
             echo "No changes."
             exit 0
           fi
 
-          git commit -m "chore: update domain sources"
+          git commit -m "chore: update domain list"
           git push
