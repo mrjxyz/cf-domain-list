@@ -1,0 +1,219 @@
+name: Sync Domain Sources
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    # 每 6 小时运行
+    - cron: "0 */6 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download sources
+        shell: bash
+        run: |
+          set -e
+
+          mkdir -p /tmp/sources
+
+          urls=(
+            "https://bestcf.pages.dev/domain/all.txt"
+            "https://bestcf.pages.dev/vps789/top10.txt"
+            "https://bestcf.pages.dev/domain/qms/all.txt"
+            "https://bestcf.pages.dev/wetest/ipv4.txt"
+            "https://bestcf.pages.dev/xinyitang3/ipv4.txt"
+            "https://bestcf.pages.dev/tiancheng/all.txt"
+            "https://bestcf.pages.dev/cmliu/all.txt"
+            "https://bestcf.pages.dev/lzj/all.txt"
+            "https://bestcf.pages.dev/lajiao/all.txt"
+          )
+
+          i=1
+
+          for url in "${urls[@]}"; do
+            echo "Downloading: $url"
+
+            curl -L \
+              --fail \
+              --retry 3 \
+              --connect-timeout 15 \
+              --max-time 60 \
+              "$url" \
+              -o "/tmp/sources/$i.txt"
+
+            if [ ! -s "/tmp/sources/$i.txt" ]; then
+              echo "ERROR: empty source: $url"
+              exit 1
+            fi
+
+            i=$((i + 1))
+          done
+
+      - name: Merge and deduplicate
+        shell: bash
+        run: |
+          set -e
+
+          mkdir -p domain
+
+          cat /tmp/sources/*.txt \
+            | tr -d '\r' \
+            | sed 's/[[:space:]]*$//' \
+            | sed '/^[[:space:]]*$/d' \
+            > /tmp/all-raw.txt
+
+          python3 <<'PY'
+          import re
+
+          input_file = "/tmp/all-raw.txt"
+          output_file = "domain/all.txt"
+
+          # 匹配：
+          # 1.2.3.4:443#备注
+          # example.com:443#备注
+          pattern = re.compile(
+              r'^([A-Za-z0-9.-]+):([0-9]{1,5})(?:#(.*))?$'
+          )
+
+          seen = set()
+          result = []
+
+          with open(input_file, "r", encoding="utf-8") as f:
+              for raw in f:
+                  line = raw.strip()
+
+                  if not line:
+                      continue
+
+                  m = pattern.match(line)
+
+                  # 非标准行直接跳过
+                  if not m:
+                      continue
+
+                  host = m.group(1).lower()
+                  port = m.group(2)
+                  remark = m.group(3) or ""
+
+                  # 地址 + 端口作为唯一 KEY
+                  key = f"{host}:{port}"
+
+                  if key in seen:
+                      continue
+
+                  seen.add(key)
+
+                  if remark:
+                      result.append(f"{host}:{port}#{remark}")
+                  else:
+                      result.append(f"{host}:{port}")
+
+          with open(output_file, "w", encoding="utf-8") as f:
+              f.write("\n".join(result))
+              f.write("\n")
+
+          print(f"Total unique entries: {len(result)}")
+          PY
+
+      - name: Generate IPv4 list
+        shell: bash
+        run: |
+          python3 <<'PY'
+          import re
+
+          src = "domain/all.txt"
+          dst = "domain/ipv4.txt"
+
+          ipv4 = re.compile(
+              r'^([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]{1,5}(#.*)?$'
+          )
+
+          result = []
+
+          with open(src, "r", encoding="utf-8") as f:
+              for line in f:
+                  line = line.strip()
+
+                  if ipv4.match(line):
+                      result.append(line)
+
+          with open(dst, "w", encoding="utf-8") as f:
+              f.write("\n".join(result))
+              f.write("\n")
+
+          print(f"IPv4 entries: {len(result)}")
+          PY
+
+      - name: Generate domain list
+        shell: bash
+        run: |
+          python3 <<'PY'
+          import re
+
+          src = "domain/all.txt"
+          dst = "domain/domains.txt"
+
+          domain = re.compile(
+              r'^[A-Za-z0-9.-]+\.[A-Za-z]{2,}:[0-9]{1,5}(#.*)?$'
+          )
+
+          result = []
+
+          with open(src, "r", encoding="utf-8") as f:
+              for line in f:
+                  line = line.strip()
+
+                  if domain.match(line):
+                      result.append(line)
+
+          with open(dst, "w", encoding="utf-8") as f:
+              f.write("\n".join(result))
+              f.write("\n")
+
+          print(f"Domain entries: {len(result)}")
+          PY
+
+      - name: Check result
+        shell: bash
+        run: |
+          set -e
+
+          total=$(grep -cve '^[[:space:]]*$' domain/all.txt || true)
+          ipv4=$(grep -cve '^[[:space:]]*$' domain/ipv4.txt || true)
+          domains=$(grep -cve '^[[:space:]]*$' domain/domains.txt || true)
+
+          echo "======================"
+          echo "Total   : $total"
+          echo "IPv4    : $ipv4"
+          echo "Domains : $domains"
+          echo "======================"
+
+          if [ "$total" -lt 5 ]; then
+            echo "ERROR: Too few entries."
+            exit 1
+          fi
+
+      - name: Commit changes
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add domain/
+
+          if git diff --cached --quiet; then
+            echo "No changes."
+            exit 0
+          fi
+
+          git commit -m "chore: update domain sources"
+          git push
